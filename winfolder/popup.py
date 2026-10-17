@@ -691,7 +691,12 @@ class FolderPopup(QWidget):
         self._icon_provider: Optional[QFileIconProvider] = None
         self._icon_cache: dict[str, tuple[str, object]] = {}
         self._last_launch: dict[str, float] = {}
-        self._fade_anim: Optional[QPropertyAnimation] = None
+        self._fade_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade_anim.setDuration(FADE_MS)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade_anim.finished.connect(self._on_fade_finished)
         self._theme = theme.current_theme()
 
         # 拖动排序状态
@@ -1390,18 +1395,12 @@ class FolderPopup(QWidget):
 
     def _show_with_fade(self) -> None:
         # 打开面板本身不能立刻被失焦逻辑误关
+        self._fade_anim.stop()
         self._suppress_auto_hide_until = time.monotonic() + 0.35
         self.setWindowOpacity(0.0)
         self.show()
         self.raise_()
-        animation = QPropertyAnimation(self, b"windowOpacity", self)
-        animation.setDuration(FADE_MS)
-        animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(self._on_fade_finished)
-        self._fade_anim = animation
-        animation.start()
+        self._fade_anim.start()
 
     def _on_fade_finished(self) -> None:
         if self.isVisible():
@@ -1438,6 +1437,7 @@ class FolderPopup(QWidget):
 
     def hideEvent(self, event) -> None:
         self._auto_hide_timer.stop()
+        self._fade_anim.stop()
         if self._drag_active or self._drag_tile is not None:
             self._cancel_drag()
         super().hideEvent(event)
@@ -1510,18 +1510,21 @@ class FolderPopup(QWidget):
         menu = self._build_tile_menu(path)
         if menu is None:
             return
-        with self._auto_hide_guard():
-            chosen = menu.exec(global_pos)
-            self._restore_popup_activation()
-        action_open, action_reveal, action_move, action_delete = menu.wf_actions  # type: ignore[attr-defined]
-        if chosen is action_open:
-            self._launch(path)
-        elif chosen is action_reveal:
-            _reveal_in_explorer(path)
-        elif chosen is action_move:
-            self._move_tile_to_desktop(path)
-        elif chosen is action_delete:
-            self._delete_tile(path)
+        try:
+            with self._auto_hide_guard():
+                chosen = menu.exec(global_pos)
+                self._restore_popup_activation()
+            action_open, action_reveal, action_move, action_delete = menu.wf_actions  # type: ignore[attr-defined]
+            if chosen is action_open:
+                self._launch(path)
+            elif chosen is action_reveal:
+                _reveal_in_explorer(path)
+            elif chosen is action_move:
+                self._move_tile_to_desktop(path)
+            elif chosen is action_delete:
+                self._delete_tile(path)
+        finally:
+            menu.deleteLater()
 
     def _build_blank_menu(self) -> Optional[QMenu]:
         if not self._folder:
@@ -1537,14 +1540,17 @@ class FolderPopup(QWidget):
         menu = self._build_blank_menu()
         if menu is None:
             return
-        with self._auto_hide_guard():
-            chosen = menu.exec(global_pos)
-            self._restore_popup_activation()
-        action_open, action_refresh = menu.wf_actions  # type: ignore[attr-defined]
-        if chosen is action_open:
-            self._open_folder()
-        elif chosen is action_refresh:
-            self._refresh_group_icon()
+        try:
+            with self._auto_hide_guard():
+                chosen = menu.exec(global_pos)
+                self._restore_popup_activation()
+            action_open, action_refresh = menu.wf_actions  # type: ignore[attr-defined]
+            if chosen is action_open:
+                self._open_folder()
+            elif chosen is action_refresh:
+                self._refresh_group_icon()
+        finally:
+            menu.deleteLater()
 
     def _move_tile_to_desktop(self, path: str) -> None:
         source_dir = os.path.dirname(os.path.abspath(path))
