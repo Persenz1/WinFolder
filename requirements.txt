@@ -1,0 +1,6 @@
+# WinFolder runtime dependencies
+# Install into the Python environment selected for this computer.
+PySide6>=6.5
+Pillow>=10.0
+uiautomation>=2.0.29
+comtypes>=1.4.17
