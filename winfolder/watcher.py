@@ -12,6 +12,9 @@ Android 风格的面板；点桌面空白处/非分组图标时发出
 --------
 * 纯 Qt 主线程实现：``QTimer`` 每 ~16ms 轮询 ``GetAsyncKeyState(VK_LBUTTON)``
   与 ``GetCursorPos``（进程 DPI-aware，坐标均为**物理像素**），不新开线程。
+* 按下时用 ``WindowFromPoint`` + ``GetAncestor(GA_ROOT)`` 确认起点在桌面
+  （``Progman`` / ``WorkerW`` / 已知透明覆盖层），否则整段手势作废——点其他
+  程序的最小化按钮后窗口消失、抬起落在桌面分组图标上的情况不会误触发。
 * 在鼠标抬起、判定为"单击"后再做一次 UI Automation
   ``ControlFromPoint(x, y)``（实测 ~2-3ms），避免每次轮询都走 COM。
 * 只有 UIA 顶层控件是桌面（``Program Manager`` / ``Progman``）时才可能发信号，
@@ -55,6 +58,30 @@ _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 _user32.GetAsyncKeyState.restype = ctypes.c_short
 _user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 _user32.GetCursorPos.restype = wintypes.BOOL
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+
+GA_ROOT = 2
+# 按下起点必须落在这些顶层窗口上，手势才可能被当作桌面单击：
+# Progman = 桌面；WorkerW = 部分场景下桌面图标列表的宿主；覆盖层见 _OVERLAY_TOP_CLASSES。
+DESKTOP_PRESS_ROOT_CLASSES = frozenset({"Progman", "WorkerW"})
+
+
+def _root_window_class_at(pos: tuple[int, int]) -> str:
+    """物理坐标 pos 处顶层窗口的类名；取不到返回空串。"""
+    pt = wintypes.POINT(pos[0], pos[1])
+    hwnd = _user32.WindowFromPoint(pt)
+    if not hwnd:
+        return ""
+    root = _user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+    buf = ctypes.create_unicode_buffer(256)
+    if _user32.GetClassNameW(root, buf, len(buf)) == 0:
+        return ""
+    return buf.value
 
 
 def _get_cursor_pos() -> Optional[tuple[int, int]]:
@@ -123,7 +150,8 @@ class ClickWatcher(QObject):
         单击了桌面上的分组文件夹图标；参数为 ``(分组文件夹显示名, 物理 x, 物理 y)``。
     desktop_clicked(int, int)
         单击了桌面空白处或非分组桌面图标；参数为 ``(物理 x, 物理 y)``。
-        落在其他窗口、exclude rect 内、拖动/长按都不会发任何信号。
+        起点在其他窗口（如点最小化按钮后抬起落在桌面）、落在 exclude rect 内、
+        拖动/长按都不会发任何信号。
     """
 
     group_clicked = Signal(str, int, int)
@@ -148,6 +176,7 @@ class ClickWatcher(QObject):
         self._button_down = False
         self._press_pos: Optional[tuple[int, int]] = None
         self._press_time = 0.0
+        self._press_on_desktop = False
 
         # group_clicked 去抖
         self._last_group_pos: Optional[tuple[int, int]] = None
@@ -219,10 +248,11 @@ class ClickWatcher(QObject):
 
         if is_down:
             if not self._button_down:
-                # 按下：记录起点。松开时才做 UIA 判定。
+                # 按下：记录起点，并确认起点在桌面上。松开时才做 UIA 判定。
                 self._button_down = True
                 self._press_pos = pos
                 self._press_time = time.perf_counter()
+                self._press_on_desktop = self._press_started_on_desktop(pos)
             return
 
         if not self._button_down:
@@ -231,21 +261,39 @@ class ClickWatcher(QObject):
         # 抬起
         self._button_down = False
         press_pos = self._press_pos
+        press_on_desktop = self._press_on_desktop
         self._press_pos = None
+        self._press_on_desktop = False
         try:
             held = time.perf_counter() - self._press_time
         except Exception:
             held = 0.0
-        self._handle_release(press_pos, pos, held)
+        self._handle_release(press_pos, pos, held, press_on_desktop)
+
+    def _press_started_on_desktop(self, pos: tuple[int, int]) -> bool:
+        """按下起点是否在桌面（或已知透明覆盖层）上。
+
+        失败时放行（保持旧行为）：WindowFromPoint 这类 API 实际上不会失败，
+        若真失败说明环境异常，此时仍走抬起时的 UIA 判定兜底。
+        """
+        try:
+            cls = _root_window_class_at(pos)
+        except Exception:
+            self._log_error("WindowFromPoint 判定按下起点失败")
+            return True
+        return cls in DESKTOP_PRESS_ROOT_CLASSES or cls in self._OVERLAY_TOP_CLASSES
 
     def _handle_release(
         self,
         press_pos: Optional[tuple[int, int]],
         release_pos: tuple[int, int],
         held_seconds: float,
+        press_on_desktop: bool,
     ) -> None:
         if press_pos is None:
             return
+        if not press_on_desktop:
+            return  # 起点在其他窗口（如最小化按钮），抬起后落在桌面也不算单击桌面
         if held_seconds > CLICK_MAX_HOLD_SEC:
             return  # 长按
         dx = release_pos[0] - press_pos[0]
@@ -411,6 +459,7 @@ class ClickWatcher(QObject):
         self._button_down = False
         self._press_pos = None
         self._press_time = 0.0
+        self._press_on_desktop = False
 
     def _log_error(self, message: str) -> None:
         """异常限流日志：每 5s 最多一条，带当前异常栈。"""
