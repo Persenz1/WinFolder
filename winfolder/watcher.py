@@ -284,24 +284,66 @@ class ClickWatcher(QObject):
 
         on_desktop = top_class == DESKTOP_TOP_CLASS or top_name == DESKTOP_TOP_NAME
         if not on_desktop:
-            # 其他窗口（浏览器/资源管理器/面板/Qt 窗口……）不产生任何信号
+            # 其他窗口（浏览器/资源管理器/面板/Qt 窗口……）不产生任何信号。
+            # 例外：透明常驻覆盖层（如 NVIDIA Overlay 的 CEF-OSC-WIDGET）会拦在
+            # UIA 命中测试前面——鼠标消息能穿透到桌面，ControlFromPoint 却返回
+            # 覆盖层。对这类已知覆盖层做兜底：按坐标在桌面图标列表里几何命中。
+            if not self._is_known_overlay(top_class, top_name):
+                return
+            hit = self._desktop_icon_at(x, y)
+            if hit is not None and self._emit_group_click(hit, pos):
+                return
+            self.desktop_clicked.emit(x, y)
             return
 
         if ctrl_type == DESKTOP_ICON_CONTROL_TYPE and name:
-            group_names = self._group_names()
-            if name in group_names:
-                if self._is_group_debounced(pos):
-                    logger.debug("group_clicked 去抖：%r @ (%d,%d)", name, x, y)
-                    return
-                self._last_group_pos = pos
-                self._last_group_time = time.perf_counter()
-                logger.info("group_clicked: %r @ (%d,%d)", name, x, y)
-                self.group_clicked.emit(name, x, y)
+            if self._emit_group_click(name, pos):
                 return
 
         # 桌面空白区域，或点击了非分组的桌面图标
         logger.debug("desktop_clicked @ (%d,%d) (%s %r)", x, y, ctrl_type, name)
         self.desktop_clicked.emit(x, y)
+
+    # 已知透明覆盖层：穿透鼠标消息，却会挡住 UIA 命中测试
+    _OVERLAY_TOP_CLASSES = frozenset({"CEF-OSC-WIDGET"})  # NVIDIA GeForce Overlay
+    _OVERLAY_TOP_NAME_KEYWORDS = ("nvidia geforce overlay",)
+
+    def _is_known_overlay(self, top_class: str, top_name: str) -> bool:
+        if top_class in self._OVERLAY_TOP_CLASSES:
+            return True
+        lowered = top_name.lower()
+        return any(keyword in lowered for keyword in self._OVERLAY_TOP_NAME_KEYWORDS)
+
+    def _emit_group_click(self, name: str, pos: tuple[int, int]) -> bool:
+        """name 属于分组时去抖并发出 group_clicked；返回是否命中分组。"""
+        if name not in self._group_names():
+            return False
+        x, y = pos
+        if self._is_group_debounced(pos):
+            logger.debug("group_clicked 去抖：%r @ (%d,%d)", name, x, y)
+            return True
+        self._last_group_pos = pos
+        self._last_group_time = time.perf_counter()
+        logger.info("group_clicked: %r @ (%d,%d)", name, x, y)
+        self.group_clicked.emit(name, x, y)
+        return True
+
+    def _desktop_icon_at(self, x: int, y: int) -> Optional[str]:
+        """覆盖层兜底：枚举桌面图标列表做几何命中，返回图标名；未命中返回 None。"""
+        try:
+            progman = auto.Control(ClassName=DESKTOP_TOP_CLASS, searchDepth=1)
+            if not progman.Exists(1):
+                return None
+            listview = progman.Control(ClassName="SysListView32")
+            if not listview.Exists(1):
+                return None
+            for item in listview.GetChildren():
+                rect = item.BoundingRectangle
+                if rect.left <= x < rect.right and rect.top <= y < rect.bottom:
+                    return (item.Name or "").strip() or None
+        except Exception:
+            self._log_error("桌面图标几何命中失败")
+        return None
 
     def _group_names(self) -> set[str]:
         """调用 provider 取分组名集合（strip 后），异常时返回空集。"""
